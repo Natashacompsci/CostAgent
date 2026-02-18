@@ -1,0 +1,14 @@
+{
+  "gemini/gemini-2.0-flash": {
+    "display_name": "Gemini 2.0 Flash",
+    "level": 1
+  },
+  "gemini/gemini-2.5-flash": {
+    "display_name": "Gemini 2.5 Flash",
+    "level": 2
+  },
+  "gemini/gemini-2.5-pro": {
+    "display_name": "Gemini 2.5 Pro",
+    "level": 3
+  }
+}

@@ -1,0 +1,9 @@
+typer
+fastapi
+uvicorn
+tiktoken
+python-dotenv
+sqlite-utils
+langchain-text-splitters
+httpx
+litellm
