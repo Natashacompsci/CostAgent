@@ -42,6 +42,7 @@ class RunTaskResponse(BaseModel):
     log_id:           int
     response:         str
     actual_cost:      float | None
+    actual_output_tokens: int | None = None
     summary:          str
 
 

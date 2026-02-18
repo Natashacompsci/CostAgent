@@ -16,6 +16,8 @@ _SCHEMA = {
     "total_cost":       float,
     "budget_exceeded":  int,   # 0 or 1 (SQLite has no boolean)
     "compressed_prompt": str,
+    "actual_cost":      float,
+    "actual_output_tokens": int,
 }
 
 
@@ -34,7 +36,7 @@ def init_db() -> None:
 def insert_run(run_data: dict) -> int:
     """Insert one task run record. Returns the new row id."""
     db = get_db()
-    db["task_runs"].insert(run_data)
+    db["task_runs"].insert(run_data, alter=True)
     return db.execute("SELECT last_insert_rowid()").fetchone()[0]
 
 

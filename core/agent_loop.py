@@ -75,14 +75,16 @@ class AgentLoop:
             )
             result["response"] = response.choices[0].message.content
             result["actual_cost"] = litellm.completion_cost(completion_response=response)
+            usage = response.usage
+            if usage:
+                result["actual_output_tokens"] = usage.completion_tokens
         else:
             if budget_exceeded:
                 result["response"] = f"[Budget exceeded] Would use {model_name}"
-            elif execute:
-                result["response"] = f"[Dry-run] Would use {model_name}"
             else:
                 result["response"] = f"[Dry-run] Would use {model_name}"
             result["actual_cost"] = None
+            result["actual_output_tokens"] = None
 
         # 7. Log to Memory
         row_id = self.logger.log_run(result, task_level)

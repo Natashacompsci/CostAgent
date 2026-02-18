@@ -26,6 +26,8 @@ class LogHandler:
             "total_cost":       run_result["total_cost"],
             "budget_exceeded":  int(run_result.get("budget_exceeded", False)),
             "compressed_prompt": run_result.get("compressed_prompt", ""),
+            "actual_cost":      run_result.get("actual_cost"),
+            "actual_output_tokens": run_result.get("actual_output_tokens"),
         }
         return insert_run(record)
 

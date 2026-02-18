@@ -50,6 +50,7 @@ def test_run_task_execute_mode(mock_cost, mock_completion):
     mock_response = MagicMock()
     mock_response.choices = [MagicMock()]
     mock_response.choices[0].message.content = "Hello from LLM!"
+    mock_response.usage.completion_tokens = 8
     mock_completion.return_value = mock_response
 
     r = client.post("/api/run", json={

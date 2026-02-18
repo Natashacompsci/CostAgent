@@ -139,7 +139,7 @@ CostAgent/
 | `memory/db.py` | sqlite-utils: `get_db()`, `init_db()`, `insert_run()`, `get_recent_runs()`, `get_cumulative_cost()` |
 | `memory/log_handler.py` | `LogHandler` class: `log_run(result, task_level)`, `cumulative_cost()` |
 
-Schema: `id, timestamp, model, task_level, prompt_tokens, output_tokens, prompt_cost, completion_cost, total_cost, budget_exceeded, compressed_prompt`
+Schema: `id, timestamp, model, task_level, prompt_tokens, output_tokens, prompt_cost, completion_cost, total_cost, budget_exceeded, compressed_prompt, actual_cost, actual_output_tokens`
 
 ### Phase 3 — Utils Layer
 
@@ -153,9 +153,9 @@ Schema: `id, timestamp, model, task_level, prompt_tokens, output_tokens, prompt_
 
 | File | Key changes |
 |---|---|
-| `core/token_estimator.py` | Uses tiktoken; `estimate()` takes a **string** (counts tokens internally), returns a **dict**; separate prompt/completion pricing |
-| `core/probabilistic_router.py` | `__init__` loads from config if no prices passed |
-| `core/agent_loop.py` | Integrates `LogHandler` for self-feedback; `run_task()` returns a dict with `log_id` and `cumulative_cost`; supports `model_override` and `budget_override` |
+| `core/token_estimator.py` | Uses `litellm.token_counter()` + `litellm.cost_per_token()`; returns a **dict** with full cost breakdown |
+| `core/probabilistic_router.py` | Config-driven routing from `models_price.json` level field; supports any litellm model ID |
+| `core/agent_loop.py` | `execute` mode via `litellm.completion()`; tracks `actual_cost` and `actual_output_tokens`; self-feedback via `LogHandler` |
 
 ### Phase 5 — API Server (`api_server.py`)
 
@@ -173,7 +173,7 @@ Thin HTTP client — does NOT import Core or Memory.
 
 | Subcommand | Description |
 |---|---|
-| `run-task` | `--prompt` or `--input-file`, `--tokens`, `--level`, `--model`, `--budget`, `--output-file` |
+| `run-task` | `--prompt` or `--input-file`, `--tokens`, `--level`, `--model`, `--budget`, `--output-file`, `--execute` |
 | `history` | `--limit` — show recent runs from the log |
 | `budget-check` | Show cumulative cost across all logged runs |
 
@@ -273,9 +273,11 @@ python3 -m pytest tests/ -v
 | `tokens` | int | no, default 100 | Expected output tokens |
 | `model` | string | no | Override router; `null` = auto-route |
 | `budget` | float | no | Per-call budget override |
+| `execute` | bool | no, default false | True = call LLM API; False = dry-run estimate only |
 
 Response includes: `model`, `prompt_tokens`, `output_tokens`, `prompt_cost`, `completion_cost`,
-`total_cost`, `budget`, `budget_exceeded`, `cumulative_cost`, `log_id`, `response`, `summary`
+`total_cost`, `budget`, `budget_exceeded`, `cumulative_cost`, `log_id`, `response`, `actual_cost`,
+`actual_output_tokens`, `summary`
 
 ---
 
@@ -358,6 +360,7 @@ a standard stateless REST service. The only additions needed are:
 | Version | Milestone | What to build | Enterprise value |
 |---|---|---|---|
 | **v0.1** | MVP | Core + CLI + API + logging | Working prototype, local cost estimation |
+| **v0.1.1** | Real API calls | litellm integration, execute mode, Gemini test config | Actual LLM calls with cost tracking; estimated vs actual cost comparison |
 | **v0.2** | Enterprise templates | `config/templates/*.json` + `/api/run/template/{id}` | Out-of-the-box task bundles; no prompt engineering needed |
 | **v0.3** | Agent integration | Webhook endpoint + Slack example + multi-step chaining | Embed into enterprise workflows (Slack, CRM, ERP) |
 | **v0.4** | Historical routing | Replace `route_task()` heuristic with model trained on `task_log.db` | Smarter routing based on real usage data |
