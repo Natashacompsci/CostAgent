@@ -40,10 +40,11 @@ def get_api_key(provider: str) -> str:
     mapping = {
         "openai": "OPENAI_API_KEY",
         "claude": "CLAUDE_API_KEY",
+        "google": "GOOGLE_API_KEY",
     }
     env_var = mapping.get(provider.lower())
     if env_var is None:
-        raise KeyError(f"Unknown provider {provider!r}. Use 'openai' or 'claude'.")
+        raise KeyError(f"Unknown provider {provider!r}. Use 'openai', 'claude', or 'google'.")
     key = os.getenv(env_var)
     if not key:
         raise KeyError(

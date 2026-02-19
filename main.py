@@ -40,6 +40,9 @@ def run_task(
     except httpx.ConnectError:
         typer.echo("Error: cannot connect to API server. Start it with: python3 api_server.py", err=True)
         raise typer.Exit(1)
+    except httpx.HTTPStatusError as e:
+        typer.echo(f"Error {e.response.status_code}: {e.response.text}", err=True)
+        raise typer.Exit(1)
 
     result = r.json()
     typer.echo(result.get("summary", json.dumps(result, indent=2)))
@@ -59,6 +62,9 @@ def history(
         r.raise_for_status()
     except httpx.ConnectError:
         typer.echo("Error: cannot connect to API server.", err=True)
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as e:
+        typer.echo(f"Error {e.response.status_code}: {e.response.text}", err=True)
         raise typer.Exit(1)
 
     runs = r.json().get("runs", [])
@@ -80,6 +86,9 @@ def budget_check():
         r.raise_for_status()
     except httpx.ConnectError:
         typer.echo("Error: cannot connect to API server.", err=True)
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as e:
+        typer.echo(f"Error {e.response.status_code}: {e.response.text}", err=True)
         raise typer.Exit(1)
 
     runs = r.json().get("runs", [])
