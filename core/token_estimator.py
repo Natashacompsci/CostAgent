@@ -24,16 +24,13 @@ class TokenEstimator:
         """
         prompt_tokens = self.count_tokens(prompt_text, model_name)
         try:
-            prompt_unit, completion_unit = litellm.cost_per_token(
+            prompt_cost, completion_cost = litellm.cost_per_token(
                 model=model_name,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=expected_output_tokens,
             )
-        except litellm.exceptions.NotFoundError:
-            prompt_unit, completion_unit = 0.0, 0.0
-
-        prompt_cost = prompt_unit * prompt_tokens
-        completion_cost = completion_unit * expected_output_tokens
+        except (litellm.exceptions.NotFoundError, Exception):
+            prompt_cost, completion_cost = 0.0, 0.0
 
         return {
             "model":           model_name,

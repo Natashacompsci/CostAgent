@@ -11,6 +11,7 @@
 CostAgent is a lightweight Token Cost Optimization & Model Routing Agent that:
 - Estimates LLM API costs **before** making calls
 - Routes tasks to the optimal model based on complexity level
+- **Cross-provider smart routing** — auto-selects the best model across all configured providers
 - Compresses prompts to reduce token usage
 - Logs all runs for budget tracking and historical analysis
 - Provides a foundation for enterprise templates and agent integration
@@ -22,8 +23,9 @@ CostAgent is a lightweight Token Cost Optimization & Model Routing Agent that:
 ```
 ┌──────────────────────────────────────────────────────┐
 │                  CLI / Typer                          │
-│  subcommands: run-task | history | budget-check       │
-│  --model --budget --input-file --output-file          │
+│  subcommands: run-task | history | budget-check      │
+│               providers                              │
+│  --model --budget --input-file --output-file         │
 └──────────────────────┬───────────────────────────────┘
                        │ HTTP POST /api/run
                        ▼
@@ -50,53 +52,104 @@ CostAgent is a lightweight Token Cost Optimization & Model Routing Agent that:
 │   memory/db.py   (sqlite-utils, task_log.db)          │
 │   memory/log_handler.py                               │
 └──────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────┐
+│               Operational logs (stdout)               │
+│   utils/observability.py (JSON lines + stack traces)  │
+│   correlated with Memory via trace_id                 │
+└──────────────────────────────────────────────────────┘
+                              ▲
+                              │ config
+┌──────────────────────────────────────────────────────┐
+│                   Config                              │
+│   config/providers.py   (4 provider presets)          │
+│   config/config.py      (auto-detect + mixed routing) │
+│   config/models_price.json (user custom override)     │
+│   .env                  (API keys + PROVIDER + BUDGET) │
+└──────────────────────────────────────────────────────┘
 ```
 
 **Key design decisions:**
 - **CLI → API → Core → Memory** — single entry point through the API; CLI is a thin HTTP client
 - **Self-feedback loop** — AgentLoop queries Memory after each run to report cumulative cost
 - **Memory encapsulated in Core** — CLI and API never touch the database directly
+- **Two logging systems** — Business Memory (SQLite) for durable analytics/training; Operational logs (stdout) for debugging/observability. Linked by `trace_id`.
+- **Cross-provider routing** — Config layer auto-detects available API keys and builds optimal model pool
+- **Three-layer config priority** — `PROVIDER` env var > auto-detect from keys > `models_price.json`
 
 ---
 
 ## 3. Tech Stack & Open-Source Libraries
 
-| Layer | Library | What it replaces |
+| Layer | Library | Purpose |
 |---|---|---|
-| Token counting | `tiktoken` | word `.split()` heuristic |
-| Prompt trimming | `langchain-text-splitters` (`TokenTextSplitter`) | manual tiktoken encode/slice/decode |
-| DB / logging | `sqlite-utils` | raw sqlite3 SQL boilerplate |
-| Config / env | `python-dotenv` | manual `os.environ` reads |
-| CLI | `typer` + `httpx` | argparse + urllib |
-| API | `fastapi` + `pydantic` | manual HTTP handling |
-| API tests | FastAPI `TestClient` (httpx) | custom test harness |
+| LLM unified API | `litellm` | Token counting, cost estimation, multi-provider API calls |
+| Token counting | `tiktoken` | Tokenizer (used by litellm internally) |
+| Prompt trimming | `langchain-text-splitters` | `TokenTextSplitter` for hard token limits |
+| Business Memory | `sqlite-utils` | Lightweight SQLite ORM for durable run records (analytics/training) |
+| Operational logs | stdlib `logging` | JSON lines + stack traces to stdout (observability) |
+| Config / env | `python-dotenv` | `.env` file loading |
+| CLI | `typer` + `httpx` | CLI framework + HTTP client |
+| API | `fastapi` + `pydantic` | REST API + request/response validation |
+| API tests | FastAPI `TestClient` | Integration testing |
 
 **`requirements.txt`:**
 ```
-typer
-fastapi
-uvicorn
-tiktoken
-python-dotenv
-sqlite-utils
-langchain-text-splitters
-httpx
+typer>=0.9
+fastapi>=0.100
+uvicorn>=0.23
+tiktoken>=0.5
+python-dotenv>=1.0
+sqlite-utils>=3.35
+langchain-text-splitters>=0.2
+httpx>=0.24
+litellm>=1.0
 ```
 
 ---
 
-## 4. Project Structure
+## 4. Multi-Provider Support
+
+### Supported Providers
+
+| Provider | Env Variable | L1 (Simple) | L2 (Medium) | L3 (Complex) |
+|----------|-------------|-------------|-------------|--------------|
+| Google | `GOOGLE_API_KEY` | Gemini 2.0 Flash | Gemini 2.5 Flash | Gemini 2.5 Pro |
+| OpenAI | `OPENAI_API_KEY` | GPT-4o Mini | GPT-4o | o3-mini |
+| Anthropic | `ANTHROPIC_API_KEY` | Claude Haiku | Claude Sonnet | Claude Opus |
+| DeepSeek | `DEEPSEEK_API_KEY` | DeepSeek V3 | _(fallback)_ | DeepSeek R1 |
+
+### Routing Modes
+
+| Mode | Trigger | Behavior |
+|------|---------|----------|
+| **Auto (mixed)** | Multiple API keys set | Cross-provider: cheapest L1, best-value L2, strongest L3 |
+| **Single provider** | One key set, or `PROVIDER=xxx` | Routes within that provider only |
+| **Custom** | Edit `models_price.json` | Any litellm-supported model |
+
+### Auto Mode Selection Logic
+
+Each model has a `cost_tier` (1=cheap, 2=mid, 3=expensive):
+- **L1**: picks model with lowest `cost_tier` across all available providers
+- **L2**: picks median `cost_tier` model
+- **L3**: picks highest `cost_tier` model (strongest)
+
+---
+
+## 5. Project Structure
 
 ```
 CostAgent/
 ├── docs/
 │   └── IMPLEMENTATION_PLAN.md    # this file
 ├── config/
-│   ├── models_price.json         # model pricing table
-│   └── config.py                 # loads JSON + .env, exposes get_model_prices() etc.
+│   ├── providers.py              # 4 provider presets with cost_tier
+│   ├── config.py                 # auto-detect, mixed routing, get_model_prices()
+│   └── models_price.json         # user custom override (fallback)
 ├── core/
 │   ├── __init__.py
-│   ├── token_estimator.py        # tiktoken-based cost estimation
+│   ├── token_estimator.py        # litellm-based cost estimation
 │   ├── semantic_compressor.py    # stopword removal + whitespace collapse
 │   ├── probabilistic_router.py   # level → model name mapping
 │   └── agent_loop.py             # orchestrator with self-feedback loop
@@ -105,6 +158,7 @@ CostAgent/
 │   └── log_handler.py            # adapter between AgentLoop results and db
 ├── utils/
 │   ├── helpers.py                # format_cost, build_run_summary, utc_now_iso
+│   ├── observability.py          # operational logs (stdout), JSON events, exceptions
 │   ├── prompt_cleaner.py         # strip HTML, normalize unicode, collapse whitespace
 │   └── prompt_trimmer.py         # TokenTextSplitter wrapper for hard token limits
 ├── tests/
@@ -113,138 +167,73 @@ CostAgent/
 │   ├── test_router.py
 │   └── test_api.py               # FastAPI TestClient integration tests
 ├── examples/
+│   ├── test_tasks.md             # 70+ test commands across 10 agent types
 │   └── test_doc.txt
 ├── main.py                       # Typer CLI (thin httpx client)
 ├── api_server.py                 # FastAPI server (central broker)
 ├── requirements.txt
-├── .env                          # API keys + BUDGET_PER_CALL
+├── .env                          # API keys + PROVIDER + BUDGET_PER_CALL
+├── .env.example
 └── README.md
 ```
 
 ---
 
-## 5. MVP Implementation Phases
+## 6. Implementation History
 
-### Phase 1 — Config Layer
+### v0.1 — MVP (completed)
 
-| File | Description |
-|---|---|
-| `config/models_price.json` | Per-model pricing with `prompt_price_per_1k`, `completion_price_per_1k`, `tiktoken_model` |
-| `config/config.py` | `get_model_prices()`, `get_budget()`, `get_api_key()` — loads from JSON + .env |
+Core pipeline: compress → route → estimate → budget-check → log.
+CLI + API server + Memory layer + unit tests.
 
-### Phase 2 — Memory Layer
+### v0.1.1 — litellm Integration (completed)
 
-| File | Description |
-|---|---|
-| `memory/db.py` | sqlite-utils: `get_db()`, `init_db()`, `insert_run()`, `get_recent_runs()`, `get_cumulative_cost()` |
-| `memory/log_handler.py` | `LogHandler` class: `log_run(result, task_level)`, `cumulative_cost()` |
+- Replaced manual tiktoken pricing with `litellm.cost_per_token()` + `litellm.token_counter()`
+- Added execute mode via `litellm.completion()` — real API calls with actual cost tracking
+- Gemini test configuration (free tier)
+- Budget guard with per-call limit
+- Estimated vs actual cost comparison
+- Fixed cost estimation accuracy (was 200-800x off due to `cost_per_token()` API misuse)
+- Empty response handling for Gemini 2.5 Pro
+- Error message cleanup (strip verbose litellm stack traces)
+- History shows actual_cost for executed runs
+- Budget-check shows estimated vs actual totals
 
-Schema: `id, timestamp, model, task_level, prompt_tokens, output_tokens, prompt_cost, completion_cost, total_cost, budget_exceeded, compressed_prompt, actual_cost, actual_output_tokens`
+### v0.1.2 — Multi-Provider Support (completed)
 
-### Phase 3 — Utils Layer
-
-| File | Description |
-|---|---|
-| `utils/helpers.py` | `format_cost()`, `truncate_text()`, `build_run_summary()`, `utc_now_iso()` |
-| `utils/prompt_cleaner.py` | `PromptCleaner`: `clean()`, `strip_html()`, `normalize_unicode()`, `collapse_whitespace()` |
-| `utils/prompt_trimmer.py` | `PromptTrimmer`: wraps `TokenTextSplitter` — `trim_to_token_limit()`, `count_tokens()` |
-
-### Phase 4 — Upgrade Core Classes
-
-| File | Key changes |
-|---|---|
-| `core/token_estimator.py` | Uses `litellm.token_counter()` + `litellm.cost_per_token()`; returns a **dict** with full cost breakdown |
-| `core/probabilistic_router.py` | Config-driven routing from `models_price.json` level field; supports any litellm model ID |
-| `core/agent_loop.py` | `execute` mode via `litellm.completion()`; tracks `actual_cost` and `actual_output_tokens`; self-feedback via `LogHandler` |
-
-### Phase 5 — API Server (`api_server.py`)
-
-| Endpoint | Method | Description |
-|---|---|---|
-| `/api/run` | POST | `{input_text, level, tokens, model?, budget?}` → full result dict |
-| `/api/runs` | GET | `?limit=10` → recent task log |
-| `/health` | GET | `{"status": "ok"}` |
-
-Request/response validated with Pydantic `BaseModel`.
-
-### Phase 6 — CLI (`main.py`)
-
-Thin HTTP client — does NOT import Core or Memory.
-
-| Subcommand | Description |
-|---|---|
-| `run-task` | `--prompt` or `--input-file`, `--tokens`, `--level`, `--model`, `--budget`, `--output-file`, `--execute` |
-| `history` | `--limit` — show recent runs from the log |
-| `budget-check` | Show cumulative cost across all logged runs |
-
-### Phase 7 — Tests
-
-| File | Key tests |
-|---|---|
-| `tests/test_token_estimator.py` | tiktoken count → int, empty → 0, estimate dict keys, total = prompt+completion, unknown model → 0, cost scales with length |
-| `tests/test_compressor.py` | stopwords removed, whitespace collapsed, max_tokens truncates, empty handled |
-| `tests/test_router.py` | level 1→DeepSeek-V3, 2→GPT-4o, 3→Claude-3.5, 99→Claude-3.5 |
-| `tests/test_api.py` | POST /api/run → 200 + required fields; model override; GET /health; level 4 → 422 |
-
-### Phase 8 — README + Examples
-
-- `README.md`: setup, architecture, CLI reference, API contract, curl examples
-- `examples/test_doc.txt`: sample document for CLI demos
+- 4 provider presets: Google, OpenAI, Anthropic, DeepSeek
+- Auto-detect available API keys from `.env`
+- **Cross-provider mixed routing** — when multiple keys present, auto-selects best model per level
+- `cost_tier` field for cross-provider cost comparison
+- `PROVIDER` env var for explicit provider selection
+- `providers` CLI command to view current routing and all presets
+- API server prints provider info on startup
+- Open-source readiness: `.env.example`, README rewrite, GPL-3.0 license
 
 ---
 
-## 6. Implementation Order (strict dependency order)
+## 7. Upgrade Roadmap
+
+| Version | Milestone | What to build | Status |
+|---|---|---|---|
+| **v0.1** | MVP | Core + CLI + API + logging | Done |
+| **v0.1.1** | Real API calls | litellm integration, execute mode, cost tracking | Done |
+| **v0.1.2** | Multi-provider | Cross-provider routing, auto-detect, 4 presets | Done |
+| **v0.2** | Enterprise templates | `config/templates/*.json` + `/api/run/template/{id}` | Planned |
+| **v0.3** | Agent integration | Webhook endpoint + Slack example + multi-step chaining | Planned |
+| **v0.4** | Historical routing | Replace heuristic with model trained on `task_log.db` | Planned |
+| **v1.0** | Cloud + SLA | Docker + gunicorn, auth middleware, rate limiting | Planned |
+
+### How each version builds on the previous:
 
 ```
-1.  requirements.txt
-2.  config/models_price.json
-3.  config/config.py
-4.  memory/db.py
-5.  utils/helpers.py
-6.  memory/log_handler.py
-7.  utils/prompt_cleaner.py
-8.  utils/prompt_trimmer.py
-9.  core/token_estimator.py
-10. core/probabilistic_router.py
-11. core/agent_loop.py
-12. api_server.py
-13. main.py
-14. tests/test_token_estimator.py
-15. tests/test_compressor.py
-16. tests/test_router.py
-17. tests/test_api.py
-18. README.md
-19. examples/test_doc.txt
-```
-
----
-
-## 7. Verification Checklist
-
-```bash
-pip install -r requirements.txt
-
-# Standalone core sanity check
-python3 -m core.agent_loop
-
-# Start server
-python3 api_server.py &
-
-# CLI subcommands
-python3 main.py run-task --prompt "Summarize this" --tokens 200 --level 2
-python3 main.py run-task --input-file examples/test_doc.txt --model GPT-4o --output-file out.json
-python3 main.py history --limit 5
-python3 main.py budget-check
-
-# Direct API calls
-curl -X POST http://localhost:8000/api/run \
-     -H "Content-Type: application/json" \
-     -d '{"input_text": "Explain quantum computing", "tokens": 150, "level": 3}'
-curl http://localhost:8000/api/runs?limit=5
-curl http://localhost:8000/health
-
-# All tests pass
-python3 -m pytest tests/ -v
+v0.1 (MVP)
+  └─ v0.1.1 (litellm)         ← real API calls, cost tracking
+       └─ v0.1.2 (Multi-provider) ← cross-provider smart routing
+            └─ v0.2 (Templates)    ← templates call AgentLoop.run_task()
+                 └─ v0.3 (Integration)  ← Slack, CRM, webhook
+                      └─ v0.4 (Smart routing)  ← ML-based from task_log.db
+                           └─ v1.0 (Cloud)     ← Docker, auth, rate limiting
 ```
 
 ---
@@ -253,16 +242,23 @@ python3 -m pytest tests/ -v
 
 ### CLI Interface
 
-| Field | Flag | Description |
+| Subcommand | Description |
+|---|---|
+| `run-task` | Route, estimate, optionally execute a task |
+| `history` | Show recent runs from the log |
+| `budget-check` | Show cumulative cost (estimated + actual) |
+| `providers` | Show current provider routing or list all presets |
+
+| Flag | Short | Description |
 |---|---|---|
-| subcommand | `run-task` / `history` / `budget-check` | CLI subcommand |
-| `--model` | `-m` | Override router, use this model directly |
-| `--budget` | `-b` | Per-call budget override |
-| `--input-file` | `-f` | Read prompt from file instead of `--prompt` |
-| `--output-file` | `-o` | Save full result JSON to file |
 | `--prompt` | `-p` | Inline prompt text |
+| `--input-file` | `-f` | Read prompt from file |
+| `--output-file` | `-o` | Save full result JSON to file |
 | `--tokens` | `-t` | Expected output token count |
 | `--level` | `-l` | Task complexity level (1-3) |
+| `--model` | `-m` | Override router, use this model directly |
+| `--budget` | `-b` | Per-call budget override |
+| `--execute` | `-e` | Actually call the LLM API |
 
 ### API Interface
 
@@ -285,105 +281,64 @@ Response includes: `model`, `prompt_tokens`, `output_tokens`, `prompt_cost`, `co
 
 ### 9.1 Enterprise Templates
 
-**What:** pre-built, out-of-the-box prompt + model + level bundles for common business tasks.
-Enterprise users only supply their variable data — no prompt engineering required.
+Pre-built prompt + model + level bundles for common business tasks.
 
-| Template ID | Input | Output | Model (level) |
-|---|---|---|---|
-| `doc-summary` | contract / report text | bullet-point summary | DeepSeek-V3 (1) |
-| `email-reply` | customer question | standard draft reply | GPT-4o (2) |
-| `meeting-notes` | raw transcript / notes | structured minutes | GPT-4o (2) |
-| `finance-analysis` | spreadsheet / bill text | data insights + flags | Claude-3.5 (3) |
-
-**How it plugs in:**
-
-```
-config/
-└─ templates/
-   ├─ doc-summary.json
-   ├─ email-reply.json
-   ├─ meeting-notes.json
-   └─ finance-analysis.json
-```
-
-Each template JSON:
 ```json
 {
   "id":            "doc-summary",
   "description":   "Condense a contract or report into key bullet points",
-  "system_prompt": "You are an expert summarizer. Return 3-5 bullet points covering the key points of the following text:",
+  "system_prompt": "You are an expert summarizer...",
   "level":          1,
   "tokens":         300
 }
 ```
 
-New API endpoint:
-```python
-@app.post("/api/run/template/{template_id}")
-def run_template(template_id: str, body: TemplateRunRequest):
-    tpl = load_template(template_id)
-    full_prompt = tpl["system_prompt"] + "\n\n" + body.input_text
-    result = AgentLoop().run_task(full_prompt, tpl["tokens"], tpl["level"])
-    return result
-```
-
-New CLI subcommand:
-```bash
-python3 main.py run-template --template doc-summary --input-file contract.txt
-```
-
-**Why it works with no Core changes:** `AgentLoop.run_task()` already accepts any string as `prompt`.
-Templates are pure configuration — adding one is just adding a JSON file.
+New endpoint: `POST /api/run/template/{template_id}`
+New CLI: `python3 main.py run-template --template doc-summary --input-file contract.txt`
 
 ### 9.2 Agent Integration
 
-**What:** embed CostAgent into enterprise workflows so it becomes an internal AI endpoint.
-
-| Integration | How it calls CostAgent | What enables it |
-|---|---|---|
-| **Slack bot** | Slack webhook → `POST /api/run/template/{id}` | stateless JSON API |
-| **CRM trigger** | CRM event → HTTP call to API server | standard REST interface |
-| **ERP / internal system** | Internal service → `POST /api/run` | pydantic schema is the contract |
-| **CLI automation / cron** | `python3 main.py run-task --input-file data.txt --output-file out.json` | `--output-file` flag |
-| **Multi-step agent chain** | Call `run_task()` N times, feed `result["response"]` as next prompt | dict return with `response` key |
-
-**Key principle:** these integrations require **zero changes to Core**. The API server is already
-a standard stateless REST service. The only additions needed are:
-- A lightweight Slack event handler (`examples/slack_integration.py`)
-- A webhook endpoint (`POST /api/webhook`)
-- A `run-template` CLI subcommand
+| Integration | How it calls CostAgent |
+|---|---|
+| **Slack bot** | Webhook → `POST /api/run/template/{id}` |
+| **CRM trigger** | HTTP call to `/api/run` |
+| **CLI automation / cron** | `--input-file` + `--output-file` |
+| **Multi-step chain** | Feed `result["response"]` as next prompt |
 
 ---
 
-## 10. Upgrade Roadmap
+## 10. Design Principles
 
-| Version | Milestone | What to build | Enterprise value |
-|---|---|---|---|
-| **v0.1** | MVP | Core + CLI + API + logging | Working prototype, local cost estimation |
-| **v0.1.1** | Real API calls | litellm integration, execute mode, Gemini test config | Actual LLM calls with cost tracking; estimated vs actual cost comparison |
-| **v0.2** | Enterprise templates | `config/templates/*.json` + `/api/run/template/{id}` | Out-of-the-box task bundles; no prompt engineering needed |
-| **v0.3** | Agent integration | Webhook endpoint + Slack example + multi-step chaining | Embed into enterprise workflows (Slack, CRM, ERP) |
-| **v0.4** | Historical routing | Replace `route_task()` heuristic with model trained on `task_log.db` | Smarter routing based on real usage data |
-| **v1.0** | Cloud + SLA | Docker + gunicorn, auth middleware, rate limiting | Production-ready deployment with uptime guarantees |
-| **v1.x** | Advanced strategy subscription | Per-tenant config, usage analytics dashboard | Paid tier with ongoing optimization and insights |
-
-### How each version builds on the previous:
-
-```
-v0.1 (MVP)
-  └─ v0.2 (Templates)        ← templates call AgentLoop.run_task(), no Core changes
-       └─ v0.3 (Integration)  ← integrations call /api/run/template/, no Core changes
-            └─ v0.4 (Smart routing)  ← new ProbabilisticRouter reads from task_log.db
-                 └─ v1.0 (Cloud)     ← Dockerize api_server.py, add auth middleware
-                      └─ v1.x (Paid tier)  ← per-tenant config, analytics dashboard
-```
-
----
-
-## 11. Design Principles for Future Development
-
-1. **Config over code** — adding a model or template should only require a JSON file change
+1. **Config over code** — adding a model or provider should only require config changes
 2. **Core is sacred** — `AgentLoop.run_task()` is the single orchestration method; don't bypass it
 3. **Memory is internal** — only AgentLoop reads/writes the database; CLI and API go through Core
+3a. **Operational logs are separate** — stack traces and fine-grained events go to stdout logs, not SQLite
 4. **CLI is a thin client** — it calls the API via HTTP; it never imports Core or Memory
 5. **Tests mock prices** — inject a fixture dict into constructors; never read from filesystem in tests
+6. **Provider-agnostic core** — Core, Memory, and Utils have zero provider-specific logic
+
+---
+
+## 11. Environments & Observability
+
+### 11.1 Multi-environment Memory
+
+CostAgent supports multi-environment deployments by tagging each run with `env_name` and allowing the
+SQLite path to be overridden.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ENV_NAME` | `dev` | Tag each run for multi-environment analysis (dev/staging/prod) |
+| `TASK_LOG_DB_PATH` | `memory/task_log.db` | Override SQLite path (recommended in Docker/production) |
+
+### 11.2 Operational logs (stdout)
+
+Operational logs are emitted as structured JSON lines to stdout and are intended for debugging and
+production observability. They include fine-grained lifecycle events and full exception stack traces.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LOG_LEVEL` | `INFO` | Operational log verbosity |
+| `LOG_JSON` | `true` | Emit operational logs as JSON lines to stdout |
+
+**Correlation**: both Business Memory and operational logs share the same `trace_id`.

@@ -29,14 +29,14 @@ def test_estimate_total_is_sum_of_parts(mock_cost, mock_counter):
 
 
 @patch("core.token_estimator.litellm.token_counter", return_value=5)
-@patch("core.token_estimator.litellm.cost_per_token", return_value=(0.0000025, 0.00001))
+@patch("core.token_estimator.litellm.cost_per_token", return_value=(0.0000125, 0.0005))
 def test_estimate_cost_calculation(mock_cost, mock_counter):
     est = TokenEstimator()
     result = est.estimate("hello world", 50, "gpt-4o")
     assert result["prompt_tokens"] == 5
     assert result["output_tokens"] == 50
-    assert result["prompt_cost"] == 0.0000025 * 5
-    assert result["completion_cost"] == 0.00001 * 50
+    assert result["prompt_cost"] == 0.0000125
+    assert result["completion_cost"] == 0.0005
 
 
 def test_count_tokens_returns_int(estimator):

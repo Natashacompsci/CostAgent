@@ -6,16 +6,25 @@ Estimates LLM API costs **before** making calls, routes tasks to the optimal mod
 compresses prompts to reduce token usage, and logs all runs for budget tracking. Supports dry-run
 (estimation only) and execute mode (real API calls via [litellm](https://github.com/BerriAI/litellm)).
 
+**Key differentiator:** cross-provider smart routing — configure multiple API keys and CostAgent
+automatically picks the most cost-effective model for each task complexity level.
+
 ## Architecture
 
 ```
 CLI (Typer) --> API Server (FastAPI) --> Core (AgentLoop) --> Memory (SQLite)
+                                          |
+                                    Config Layer
+                              (providers.py + config.py)
+                          auto-detect keys → build model pool
 ```
 
 - **CLI** — thin httpx client, sends requests to the API server
 - **API Server** — FastAPI, handles routing/estimation/execution
 - **Core** — AgentLoop orchestrates: compress → route → estimate → budget-check → [execute] → log
-- **Memory** — SQLite via sqlite-utils, tracks all runs and cumulative cost
+- **Config** — auto-detects available API keys, builds optimal model pool across providers
+- **Memory** — SQLite via sqlite-utils, stores per-run records for history and budget tracking
+- **Observability** — structured logs to stdout (JSON by default) so you can hook into your logging stack
 
 ## Requirements
 
@@ -32,11 +41,11 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Copy `.env.example` to `.env` and add your API keys:
+Copy `.env.example` to `.env` and add your API key(s):
 
 ```bash
 cp .env.example .env
-# Edit .env with your keys
+# Edit .env — only fill in the key(s) you have
 ```
 
 ## BYOK (Bring Your Own Key)
@@ -44,14 +53,31 @@ cp .env.example .env
 CostAgent uses [litellm](https://github.com/BerriAI/litellm) which reads API keys from environment
 variables. Set the key(s) for the provider(s) you want to use:
 
-| Provider | Env Variable | Models |
-|----------|-------------|--------|
-| Google | `GOOGLE_API_KEY` | gemini-2.0-flash, gemini-2.5-flash, gemini-2.5-pro |
-| OpenAI | `OPENAI_API_KEY` | gpt-4o, gpt-4o-mini, etc. |
-| Anthropic | `ANTHROPIC_API_KEY` | claude-sonnet, claude-opus, etc. |
+| Provider | Env Variable | L1 (Simple) | L2 (Medium) | L3 (Complex) |
+|----------|-------------|-------------|-------------|--------------|
+| Google | `GOOGLE_API_KEY` | Gemini 2.0 Flash | Gemini 2.5 Flash | Gemini 2.5 Pro |
+| OpenAI | `OPENAI_API_KEY` | GPT-4o Mini | GPT-4o | o3-mini |
+| Anthropic | `ANTHROPIC_API_KEY` | Claude Haiku | Claude Sonnet | Claude Opus |
+| DeepSeek | `DEEPSEEK_API_KEY` | DeepSeek V3 | _(fallback)_ | DeepSeek R1 |
 
-You only need the key for the models configured in `config/models_price.json`. By default,
-CostAgent is configured with Gemini models (Google offers a free tier).
+### Routing Modes
+
+CostAgent supports three routing modes:
+
+| Mode | When | Behavior |
+|------|------|----------|
+| **Auto (mixed)** | Multiple API keys set | Picks best model per level across all providers |
+| **Single provider** | One key set, or `PROVIDER=google` | Routes within that provider's models only |
+| **Custom** | Edit `config/models_price.json` | Use any litellm-supported model |
+
+**Auto mode example:** with both `GOOGLE_API_KEY` and `OPENAI_API_KEY`:
+```
+L1 → Gemini 2.0 Flash  (cheapest available)
+L2 → GPT-4o            (best value mid-tier)
+L3 → o3-mini           (strongest available)
+```
+
+To force a specific provider: `PROVIDER=openai` in `.env`.
 
 ## Usage
 
@@ -60,6 +86,16 @@ CostAgent is configured with Gemini models (Google offers a free tier).
 ```bash
 python3 api_server.py
 ```
+
+### Environments & basic observability
+
+CostAgent is designed to run in multiple environments (dev/staging/prod) and to integrate with your
+existing logging pipeline:
+
+- You can point the internal SQLite database to a custom path (e.g. a mounted volume in Docker).
+- Each run is tagged with an environment name for easier separation of dev vs prod data.
+- API and core components emit structured logs (JSON by default) with a correlation ID so you can
+  trace a single call across your logging system.
 
 ### CLI Commands
 
@@ -74,7 +110,7 @@ python3 main.py run-task -p "What is the capital of France?" -t 20 -l 1 -e
 python3 main.py run-task -f examples/test_doc.txt -t 200 -l 2
 
 # Override model (bypass router)
-python3 main.py run-task -p "Hello" -t 20 -l 1 -m "gemini/gemini-2.5-pro"
+python3 main.py run-task -p "Hello" -t 20 -l 1 -m "gpt-4o"
 
 # Override budget
 python3 main.py run-task -p "Hello" -t 20 -l 1 -b 0.05
@@ -87,6 +123,12 @@ python3 main.py history -n 5
 
 # Check cumulative cost
 python3 main.py budget-check
+
+# Show current provider and model routing
+python3 main.py providers
+
+# List all available provider presets
+python3 main.py providers --list
 ```
 
 ### CLI Options
@@ -146,22 +188,43 @@ Returns `{"status": "ok"}`.
 
 ## Model Configuration
 
-Edit `config/models_price.json` to configure which model handles each complexity level:
+### Option 1: Provider presets (recommended)
+
+Set your API key(s) in `.env` and CostAgent auto-configures:
+
+```bash
+# .env
+GOOGLE_API_KEY=your_key    # → auto-selects Google preset
+OPENAI_API_KEY=your_key    # → if both set, auto mode kicks in
+```
+
+### Option 2: Explicit provider
+
+```bash
+# .env
+PROVIDER=openai            # → force OpenAI preset regardless of other keys
+```
+
+### Option 3: Custom models
+
+Edit `config/models_price.json` to define your own model pool:
 
 ```json
 {
-  "gemini/gemini-2.0-flash": { "display_name": "Gemini 2.0 Flash", "level": 1 },
+  "gpt-4o-mini":           { "display_name": "GPT-4o Mini",  "level": 1 },
   "gemini/gemini-2.5-flash": { "display_name": "Gemini 2.5 Flash", "level": 2 },
-  "gemini/gemini-2.5-pro":   { "display_name": "Gemini 2.5 Pro",   "level": 3 }
+  "anthropic/claude-sonnet-4-20250514": { "display_name": "Claude Sonnet", "level": 3 }
 }
 ```
 
-Model IDs follow litellm's naming convention (`provider/model-name`). Pricing is auto-fetched
-from litellm's built-in cost database.
+Model IDs follow litellm's naming convention. Pricing is auto-fetched from litellm's built-in cost database.
+
+**Priority:** `PROVIDER` env var > auto-detect from keys > `models_price.json` fallback.
 
 ## Test Tasks
 
-See [examples/test_tasks.md](examples/test_tasks.md) for ready-to-run commands at each level.
+See [examples/test_tasks.md](examples/test_tasks.md) for 70+ ready-to-run test commands covering
+10 agent types, workflows, and edge cases.
 
 ## Running Tests
 
