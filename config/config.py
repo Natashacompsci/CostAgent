@@ -135,6 +135,29 @@ def get_budget() -> float:
         )
 
 
+def get_quality_eval_enabled() -> bool:
+    """Whether to run quality evaluation after execute mode. Default: False."""
+    return os.getenv("QUALITY_EVAL_ENABLED", "false").lower() in ("true", "1", "yes")
+
+
+def get_quality_threshold() -> int:
+    """Minimum acceptable quality score (1-10). Default: 6."""
+    raw = os.getenv("QUALITY_THRESHOLD", "6")
+    return max(1, min(10, int(raw)))
+
+
+def get_quality_max_retries() -> int:
+    """Max quality-based retries (model escalations). Default: 2."""
+    raw = os.getenv("QUALITY_MAX_RETRIES", "2")
+    return max(0, min(5, int(raw)))
+
+
+def get_judge_model() -> str | None:
+    """Override judge model. Default: None (use evaluator default)."""
+    raw = os.getenv("JUDGE_MODEL", "").strip()
+    return raw or None
+
+
 def get_api_key(provider: str) -> str:
     """Return the API key for a provider."""
     env_var = ENV_KEYS.get(provider.lower())

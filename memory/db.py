@@ -23,8 +23,7 @@ def get_db_path() -> Path:
 
 _INIT_LOCK = threading.Lock()
 _INIT_DONE = False
-_DB_CACHE_LOCK = threading.Lock()
-_DB_CACHE: dict[str, Database] = {}
+_thread_local = threading.local()
 
 
 # --- Schema for the task_runs table ---
@@ -62,17 +61,21 @@ _SCHEMA = {
 
 
 def get_db() -> Database:
-    """Open (or create) the SQLite database at DB_PATH."""
+    """Open (or create) the SQLite database at DB_PATH.
+
+    Uses thread-local storage so each thread gets its own connection,
+    avoiding SQLite's 'objects created in a thread' errors.
+    """
     path = str(get_db_path())
-    with _DB_CACHE_LOCK:
-        db = _DB_CACHE.get(path)
-        if db is None:
-            db = Database(path)
-            # Reduce lock flakiness under multi-threaded access (FastAPI/TestClient).
-            db.conn.execute("PRAGMA busy_timeout = 5000")
-            db.conn.execute("PRAGMA journal_mode = WAL")
-            _DB_CACHE[path] = db
-        return db
+    db = getattr(_thread_local, "db", None)
+    cached_path = getattr(_thread_local, "db_path", None)
+    if db is None or cached_path != path:
+        db = Database(path)
+        db.conn.execute("PRAGMA busy_timeout = 5000")
+        db.conn.execute("PRAGMA journal_mode = WAL")
+        _thread_local.db = db
+        _thread_local.db_path = path
+    return db
 
 
 def init_db() -> None:
@@ -113,6 +116,10 @@ def init_db() -> None:
                     "INSERT INTO meta (key, value) VALUES (?, ?)",
                     ["schema_version", "2"],
                 )
+
+        # Commit any pending transaction so the write lock is released
+        # before request threads try to access the database.
+        db.conn.commit()
 
         _INIT_DONE = True
 

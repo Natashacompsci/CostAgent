@@ -6,30 +6,43 @@ Estimates LLM API costs **before** making calls, routes tasks to the optimal mod
 compresses prompts to reduce token usage, and logs all runs for budget tracking. Supports dry-run
 (estimation only) and execute mode (real API calls via [litellm](https://github.com/BerriAI/litellm)).
 
-**Key differentiator:** cross-provider smart routing — configure multiple API keys and CostAgent
-automatically picks the most cost-effective model for each task complexity level.
+**Key differentiators:**
+- **Cross-provider smart routing** — configure multiple API keys and CostAgent automatically picks the most cost-effective model for each task complexity level
+- **Quality-aware auto-fallback** — optional LLM-as-judge quality gate that automatically retries with a stronger model when output quality is low, ensuring reliable results even with cheap models
 
-## Architecture
+## How It Works
 
 ```
-CLI (Typer) --> API Server (FastAPI) --> Core (AgentLoop) --> Memory (SQLite)
-                                          |
-                                    Config Layer
-                              (providers.py + config.py)
-                          auto-detect keys → build model pool
+Your App / Agent
+       │
+       ▼
+  POST /api/run
+       │
+       ▼
+┌─────────────────┐
+│   CostAgent     │
+│                 │
+│  Compress       │
+│  Route          │
+│  Estimate       │
+│  Budget-check   │
+│  [Execute]      │
+│  [Quality gate] │
+│  Log            │
+└────────┬────────┘
+         │
+         ▼
+   Structured response
+   (model, cost, budget_exceeded, response)
 ```
 
-- **CLI** — thin httpx client, sends requests to the API server
-- **API Server** — FastAPI, handles routing/estimation/execution
-- **Core** — AgentLoop orchestrates: compress → route → estimate → budget-check → [execute] → log
-- **Config** — auto-detects available API keys, builds optimal model pool across providers
-- **Memory** — SQLite via sqlite-utils, stores per-run records for history and budget tracking
-- **Observability** — structured logs to stdout (JSON by default) so you can hook into your logging stack
+CostAgent takes your prompt, optimizes it, selects the best model, checks your budget, and optionally
+calls the LLM — all through a single API call.
 
 ## Requirements
 
-- Python 3.11+ (uses `X | Y` union syntax)
-- API key for at least one LLM provider (see below)
+- Python 3.11+
+- API key for at least one LLM provider
 
 ## Setup
 
@@ -62,8 +75,6 @@ variables. Set the key(s) for the provider(s) you want to use:
 
 ### Routing Modes
 
-CostAgent supports three routing modes:
-
 | Mode | When | Behavior |
 |------|------|----------|
 | **Auto (mixed)** | Multiple API keys set | Picks best model per level across all providers |
@@ -86,16 +97,6 @@ To force a specific provider: `PROVIDER=openai` in `.env`.
 ```bash
 python3 api_server.py
 ```
-
-### Environments & basic observability
-
-CostAgent is designed to run in multiple environments (dev/staging/prod) and to integrate with your
-existing logging pipeline:
-
-- You can point the internal SQLite database to a custom path (e.g. a mounted volume in Docker).
-- Each run is tagged with an environment name for easier separation of dev vs prod data.
-- API and core components emit structured logs (JSON by default) with a correlation ID so you can
-  trace a single call across your logging system.
 
 ### CLI Commands
 
@@ -126,9 +127,6 @@ python3 main.py budget-check
 
 # Show current provider and model routing
 python3 main.py providers
-
-# List all available provider presets
-python3 main.py providers --list
 ```
 
 ### CLI Options
@@ -144,7 +142,17 @@ python3 main.py providers --list
 | `--budget` | `-b` | Per-call budget override |
 | `--execute` | `-e` | Actually call the LLM API |
 
-## API Contract
+## API
+
+### Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/run` | POST | Full pipeline: estimate + optional execution + logging |
+| `/api/estimate` | POST | Read-only cost estimate (no logging, no execution) |
+| `/api/route` | POST | Model selection only |
+| `/api/runs` | GET | Query run history |
+| `/health` | GET | Health check |
 
 ### POST /api/run
 
@@ -153,38 +161,62 @@ Request:
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | input_text | string | yes | - | The prompt |
+| tenant_id | string | no | null | Tenant identifier for multi-agent attribution |
+| caller_id | string | no | null | Caller/service identifier for attribution |
 | level | int (1-3) | no | 1 | Task complexity |
 | tokens | int | no | 100 | Expected output tokens |
 | model | string | no | null | Override auto-routing |
 | budget | float | no | null | Per-call budget override |
 | execute | bool | no | false | True = call LLM API; False = dry-run |
 
-Response:
+Response (200):
 
 | Field | Type | Description |
 |-------|------|-------------|
 | model | string | Model used |
-| prompt_tokens | int | Estimated prompt tokens |
-| output_tokens | int | Expected output tokens |
-| prompt_cost | float | Estimated prompt cost |
-| completion_cost | float | Estimated completion cost |
-| total_cost | float | Total estimated cost |
-| budget | float | Budget used for this call |
+| prompt_tokens | int | Prompt token count |
+| total_cost | float | Estimated total cost |
 | budget_exceeded | bool | Whether cost exceeds budget |
 | cumulative_cost | float | Total cost across all runs |
-| log_id | int | Database row ID |
 | response | string | LLM response or dry-run message |
 | actual_cost | float/null | Real cost (execute mode only) |
-| actual_output_tokens | int/null | Real output tokens (execute mode only) |
-| summary | string | Formatted summary text |
+| quality_score | int/null | Quality score 1-10 (when quality eval enabled) |
+| quality_retries | int/null | Number of model escalation retries |
+| quality_eval_cost | float/null | Cost of quality evaluation calls |
+| original_model | string/null | Original model before escalation (if retried) |
+| summary | string | Formatted summary |
+| trace_id | string | Correlation ID |
 
-### GET /api/runs?limit=10
+Error response (500/502):
 
-Returns `{"runs": [...]}` with the most recent runs.
+| Field | Type | Description |
+|-------|------|-------------|
+| error_code | string | `provider_unavailable` / `provider_auth_error` / `internal_error` |
+| message | string | Human-readable error description |
+| trace_id | string/null | Correlation ID |
+| details | object/null | Extra context (e.g. exception type) |
 
-### GET /health
+## Integrations
 
-Returns `{"status": "ok"}`.
+CostAgent can be integrated into any agent framework. See [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md) for details.
+
+| Method | Best for |
+|--------|----------|
+| HTTP API | Any language / framework |
+| Python SDK | Python scripts, custom agents |
+| OpenAI tools | GPT-based agents, AutoGen |
+| LangChain tools | LangChain / LangGraph agents |
+| OpenClaw Skill | OpenClaw personal AI assistant |
+
+### Quick example (Python SDK)
+
+```python
+from costagent_sdk import CostAgentClient
+
+client = CostAgentClient(tenant_id="my-app", caller_id="my-agent")
+result = client.run(input_text="Summarize this article...", level=2, tokens=200)
+print(f"Model: {result['model']}, Cost: ${result['total_cost']:.6f}")
+```
 
 ## Model Configuration
 
@@ -221,10 +253,24 @@ Model IDs follow litellm's naming convention. Pricing is auto-fetched from litel
 
 **Priority:** `PROVIDER` env var > auto-detect from keys > `models_price.json` fallback.
 
+## Environments & Observability
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ENV_NAME` | `dev` | Tag runs with environment name (dev/staging/prod) |
+| `TASK_LOG_DB_PATH` | `memory/task_log.db` | Override SQLite path (for Docker/production) |
+| `LOG_LEVEL` | `INFO` | Log verbosity |
+| `LOG_JSON` | `true` | Emit structured JSON logs to stdout |
+| `QUALITY_EVAL_ENABLED` | `false` | Enable quality evaluation with auto-fallback |
+| `QUALITY_THRESHOLD` | `6` | Minimum quality score (1-10) to accept without retry |
+| `QUALITY_MAX_RETRIES` | `2` | Max escalation retries on low quality |
+| `JUDGE_MODEL` | `gemini/gemini-2.0-flash` | Model used for quality evaluation |
+
+Each run gets a `trace_id` for end-to-end correlation across logs and stored records.
+
 ## Test Tasks
 
-See [examples/test_tasks.md](examples/test_tasks.md) for 70+ ready-to-run test commands covering
-10 agent types, workflows, and edge cases.
+See [examples/test_tasks.md](examples/test_tasks.md) for 70+ ready-to-run test commands.
 
 ## Running Tests
 

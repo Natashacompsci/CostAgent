@@ -63,6 +63,11 @@ class LogHandler:
             "compressed_prompt":     compressed_prompt,
             "actual_cost":           run_result.get("actual_cost"),
             "actual_output_tokens":  run_result.get("actual_output_tokens"),
+            "quality_score":         run_result.get("quality_score"),
+            "quality_reason":        run_result.get("quality_reason"),
+            "quality_retries":       run_result.get("quality_retries"),
+            "quality_eval_cost":     run_result.get("quality_eval_cost"),
+            "original_model":        run_result.get("original_model"),
         }
         return insert_run(record)
 

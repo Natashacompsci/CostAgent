@@ -32,6 +32,12 @@ def build_run_summary(run_result: dict) -> str:
         lines.append(f"Actual cost:      {format_cost(run_result['actual_cost'])}")
     if run_result.get("actual_output_tokens") is not None:
         lines.append(f"Actual tokens:    {run_result['actual_output_tokens']}")
+    if run_result.get("quality_score") is not None:
+        lines.append(f"Quality score:    {run_result['quality_score']}/10")
+    if run_result.get("quality_retries") and run_result["quality_retries"] > 0:
+        lines.append(f"Quality retries:  {run_result['quality_retries']} (from {run_result.get('original_model', '?')})")
+    if run_result.get("quality_eval_cost"):
+        lines.append(f"Eval cost:        {format_cost(run_result['quality_eval_cost'])}")
     if "log_id" in run_result:
         lines.append(f"Log ID:           {run_result['log_id']}")
     response = run_result.get("response", "")

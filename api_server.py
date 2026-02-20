@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import uvicorn
 
@@ -57,6 +58,11 @@ class RunTaskResponse(BaseModel):
     response:         str
     actual_cost:      float | None
     actual_output_tokens: int | None = None
+    quality_score:    int | None = None
+    quality_reason:   str | None = None
+    quality_retries:  int | None = None
+    quality_eval_cost: float | None = None
+    original_model:   str | None = None
     summary:          str
 
 
@@ -91,6 +97,28 @@ class EstimateResponse(BaseModel):
     budget_exceeded: bool
     compression_ratio: float
     latency_ms: float
+
+
+class ErrorResponse(BaseModel):
+    error_code: str = Field(description="Machine-readable error code: provider_unavailable | provider_auth_error | internal_error")
+    message:    str = Field(description="Human-readable error description")
+    trace_id:   str | None = Field(None, description="Trace ID for correlation (if available)")
+    details:    dict | None = Field(None, description="Optional extra context")
+
+
+# --- Error classification ---
+
+_PROVIDER_KEYWORDS = ("APIError", "AuthenticationError", "RateLimitError", "Timeout", "APIConnectionError", "ServiceUnavailableError")
+
+def _classify_error(exc: Exception) -> tuple[str, int]:
+    """Return (error_code, http_status) based on exception type."""
+    exc_name = type(exc).__name__
+    msg = str(exc).lower()
+    if exc_name in ("AuthenticationError",) or "authentication" in msg or "invalid api key" in msg:
+        return "provider_auth_error", 502
+    if any(kw.lower() in exc_name.lower() or kw.lower() in msg for kw in _PROVIDER_KEYWORDS):
+        return "provider_unavailable", 502
+    return "internal_error", 500
 
 
 # --- Endpoints ---
@@ -192,8 +220,16 @@ def run_task(body: RunTaskRequest):
         # Extract the key error message, strip verbose litellm stack traces
         if "\n" in msg:
             msg = msg.split("\n")[0]
-        ops.exception("api_run_error", extra={"extra_fields": {"event": "api_run_error"}})
-        raise HTTPException(status_code=500, detail=msg)
+        error_code, status_code = _classify_error(e)
+        ops.exception("api_run_error", extra={"extra_fields": {"event": "api_run_error", "error_code": error_code}})
+        return JSONResponse(
+            status_code=status_code,
+            content=ErrorResponse(
+                error_code=error_code,
+                message=msg,
+                details={"exception_type": type(e).__name__},
+            ).model_dump(),
+        )
 
     log_event(
         ops,

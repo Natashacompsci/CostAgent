@@ -81,3 +81,37 @@ def test_list_runs():
     runs = r.json()["runs"]
     assert isinstance(runs, list)
     assert len(runs) >= 1
+
+
+# --- Structured error response tests ---
+
+@patch("core.agent_loop.litellm.completion", side_effect=Exception("Something went wrong"))
+def test_run_error_returns_structured_error(mock_completion):
+    r = client.post("/api/run", json={
+        "input_text": "hello", "tokens": 50, "level": 1, "execute": True
+    })
+    assert r.status_code == 500
+    data = r.json()
+    assert data["error_code"] == "internal_error"
+    assert "message" in data
+    assert data["details"]["exception_type"] == "Exception"
+
+
+@patch("core.agent_loop.litellm.completion", side_effect=type("AuthenticationError", (Exception,), {})("invalid api key"))
+def test_run_auth_error_returns_502(mock_completion):
+    r = client.post("/api/run", json={
+        "input_text": "hello", "tokens": 50, "level": 1, "execute": True
+    })
+    assert r.status_code == 502
+    data = r.json()
+    assert data["error_code"] == "provider_auth_error"
+
+
+@patch("core.agent_loop.litellm.completion", side_effect=type("APIConnectionError", (Exception,), {})("connection refused"))
+def test_run_provider_error_returns_502(mock_completion):
+    r = client.post("/api/run", json={
+        "input_text": "hello", "tokens": 50, "level": 1, "execute": True
+    })
+    assert r.status_code == 502
+    data = r.json()
+    assert data["error_code"] == "provider_unavailable"

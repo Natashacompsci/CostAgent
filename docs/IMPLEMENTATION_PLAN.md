@@ -13,6 +13,7 @@ CostAgent is a lightweight Token Cost Optimization & Model Routing Agent that:
 - Routes tasks to the optimal model based on complexity level
 - **Cross-provider smart routing** — auto-selects the best model across all configured providers
 - Compresses prompts to reduce token usage
+- **Quality evaluation with auto-fallback** — LLM-as-judge scores output quality, auto-escalates to stronger model on low scores
 - Logs all runs for budget tracking and historical analysis
 - Provides a foundation for enterprise templates and agent integration
 
@@ -38,11 +39,12 @@ CostAgent is a lightweight Token Cost Optimization & Model Routing Agent that:
 ┌──────────────────────────────────────────────────────┐
 │                    Core                               │
 │   TokenEstimator  SemanticCompressor                  │
-│   ProbabilisticRouter                                 │
+│   ProbabilisticRouter  QualityEvaluator               │
 │              └──────────────┐                         │
 │                   ┌─────────▼──────────────┐          │
 │                   │      AgentLoop          │          │
 │                   │  (self-feedback loop)   │◀────────┤
+│                   │  (quality retry loop)   │          │
 │                   └─────────┬──────────────┘          │
 └─────────────────────────────┼─────────────────────────┘
                               │ query / update
@@ -142,7 +144,8 @@ Each model has a `cost_tier` (1=cheap, 2=mid, 3=expensive):
 ```
 CostAgent/
 ├── docs/
-│   └── IMPLEMENTATION_PLAN.md    # this file
+│   ├── IMPLEMENTATION_PLAN.md    # this file (private, not on GitHub)
+│   └── INTEGRATIONS.md           # integration guide for all methods
 ├── config/
 │   ├── providers.py              # 4 provider presets with cost_tier
 │   ├── config.py                 # auto-detect, mixed routing, get_model_prices()
@@ -152,7 +155,8 @@ CostAgent/
 │   ├── token_estimator.py        # litellm-based cost estimation
 │   ├── semantic_compressor.py    # stopword removal + whitespace collapse
 │   ├── probabilistic_router.py   # level → model name mapping
-│   └── agent_loop.py             # orchestrator with self-feedback loop
+│   ├── quality_evaluator.py      # LLM-as-judge quality scoring + fail-open
+│   └── agent_loop.py             # orchestrator with self-feedback + quality retry loop
 ├── memory/
 │   ├── db.py                     # sqlite-utils database layer
 │   └── log_handler.py            # adapter between AgentLoop results and db
@@ -161,16 +165,24 @@ CostAgent/
 │   ├── observability.py          # operational logs (stdout), JSON events, exceptions
 │   ├── prompt_cleaner.py         # strip HTML, normalize unicode, collapse whitespace
 │   └── prompt_trimmer.py         # TokenTextSplitter wrapper for hard token limits
+├── integrations/
+│   ├── openai_tools.py           # OpenAI-compatible tool schemas + dispatch
+│   ├── langchain_tools.py        # LangChain StructuredTool wrappers
+│   └── openclaw/
+│       ├── SKILL.md              # OpenClaw skill definition
+│       └── README.md             # OpenClaw installation guide
 ├── tests/
 │   ├── test_token_estimator.py
 │   ├── test_compressor.py
 │   ├── test_router.py
+│   ├── test_quality.py            # quality evaluator + retry flow tests
 │   └── test_api.py               # FastAPI TestClient integration tests
 ├── examples/
 │   ├── test_tasks.md             # 70+ test commands across 10 agent types
 │   └── test_doc.txt
 ├── main.py                       # Typer CLI (thin httpx client)
 ├── api_server.py                 # FastAPI server (central broker)
+├── costagent_sdk.py              # Python SDK (thin httpx wrapper)
 ├── requirements.txt
 ├── .env                          # API keys + PROVIDER + BUDGET_PER_CALL
 ├── .env.example
@@ -210,6 +222,27 @@ CLI + API server + Memory layer + unit tests.
 - API server prints provider info on startup
 - Open-source readiness: `.env.example`, README rewrite, GPL-3.0 license
 
+### v0.1.3 — Agent Native (completed)
+
+- **Structured error model** — `ErrorResponse` schema with machine-readable `error_code` (`provider_unavailable`, `provider_auth_error`, `internal_error`), proper HTTP status codes (502 for provider errors, 500 for internal)
+- **Error classification** — `_classify_error()` auto-detects error type from exception class name and message keywords
+- **OpenClaw Skill** — `integrations/openclaw/SKILL.md` for one-click integration with the OpenClaw AI agent framework
+- **Integration docs** — `docs/INTEGRATIONS.md` covering all 5 integration methods (HTTP, Python SDK, OpenAI tools, LangChain, OpenClaw)
+- **README rewrite** — open-core style: public-facing product page without exposing internal algorithm details
+- Already had (from v0.1.2): `tenant_id`/`caller_id` multi-tenant fields, `costagent_sdk.py`, OpenAI tools wrapper, LangChain tools wrapper
+
+### v0.1.4 — Quality Evaluation & Auto-Fallback (completed)
+
+- **LLM-as-judge quality gate** — uses a cheap judge model (Gemini Flash by default) to score LLM output 1-10 on relevance, completeness, accuracy, and clarity
+- **Auto-escalation retry loop** — if quality score < threshold, auto-escalates L1→L2→L3 and retries with a stronger model
+- **Fail-open design** — on any judge error (network, parse, timeout), returns score=10 so the pipeline is never blocked
+- **Three-tier response parsing** — JSON → regex fallback → fail-open (score=10)
+- **Configurable via env vars** — disabled by default (`QUALITY_EVAL_ENABLED=false`); zero overhead when off
+- **Input truncation** — judge inputs are truncated (2000/3000 chars) to control evaluation cost
+- **5 new Memory fields** — `quality_score`, `quality_reason`, `quality_retries`, `quality_eval_cost`, `original_model` auto-added via `alter=True`
+- **Config getters** — `get_quality_eval_enabled()`, `get_quality_threshold()`, `get_quality_max_retries()`, `get_judge_model()` following existing `get_budget()` pattern
+- **13 new tests** — `_parse_score()` unit tests, `evaluate()` mocked tests, integration tests for retry flow with alternating task/judge mock responses
+
 ---
 
 ## 7. Upgrade Roadmap
@@ -219,8 +252,10 @@ CLI + API server + Memory layer + unit tests.
 | **v0.1** | MVP | Core + CLI + API + logging | Done |
 | **v0.1.1** | Real API calls | litellm integration, execute mode, cost tracking | Done |
 | **v0.1.2** | Multi-provider | Cross-provider routing, auto-detect, 4 presets | Done |
+| **v0.1.3** | Agent Native | Structured errors, OpenClaw skill, integration docs | Done |
+| **v0.1.4** | Quality Gate | LLM-as-judge eval, auto-fallback retry, fail-open | Done |
 | **v0.2** | Enterprise templates | `config/templates/*.json` + `/api/run/template/{id}` | Planned |
-| **v0.3** | Agent integration | Webhook endpoint + Slack example + multi-step chaining | Planned |
+| **v0.3** | Deep integration | Webhook endpoint + Slack example + multi-step chaining | Planned |
 | **v0.4** | Historical routing | Replace heuristic with model trained on `task_log.db` | Planned |
 | **v1.0** | Cloud + SLA | Docker + gunicorn, auth middleware, rate limiting | Planned |
 
@@ -228,17 +263,83 @@ CLI + API server + Memory layer + unit tests.
 
 ```
 v0.1 (MVP)
-  └─ v0.1.1 (litellm)         ← real API calls, cost tracking
-       └─ v0.1.2 (Multi-provider) ← cross-provider smart routing
-            └─ v0.2 (Templates)    ← templates call AgentLoop.run_task()
-                 └─ v0.3 (Integration)  ← Slack, CRM, webhook
-                      └─ v0.4 (Smart routing)  ← ML-based from task_log.db
-                           └─ v1.0 (Cloud)     ← Docker, auth, rate limiting
+  └─ v0.1.1 (litellm)            ← real API calls, cost tracking
+       └─ v0.1.2 (Multi-provider)   ← cross-provider smart routing
+            └─ v0.1.3 (Agent Native)    ← structured errors, integrations, OpenClaw
+                 └─ v0.1.4 (Quality Gate)    ← LLM-as-judge, auto-fallback retry
+                      └─ v0.2 (Templates)       ← templates call AgentLoop.run_task()
+                      └─ v0.3 (Integration)   ← Slack, CRM, webhook
+                           └─ v0.4 (Smart routing)  ← ML-based from task_log.db
+                                └─ v1.0 (Cloud)     ← Docker, auth, rate limiting
 ```
 
 ---
 
-## 8. Interface Contracts
+## 8. Agent Native Architecture
+
+### Integration Layer
+
+CostAgent exposes five integration methods, all calling the same Core via HTTP:
+
+```
+                    ┌─────────────────────┐
+                    │     Core (private)   │
+                    │  AgentLoop           │
+                    │  SemanticCompressor  │
+                    │  ProbabilisticRouter │
+                    │  TokenEstimator      │
+                    └─────────┬───────────┘
+                              │
+                    ┌─────────▼───────────┐
+                    │  API Server (public) │
+                    │  /api/run            │
+                    │  /api/estimate       │
+                    │  /api/route          │
+                    └─────────┬───────────┘
+                              │
+        ┌─────────┬───────────┼───────────┬──────────┐
+        ▼         ▼           ▼           ▼          ▼
+   Python SDK  OpenAI    LangChain   OpenClaw     Raw HTTP
+              tools      tools       Skill       (curl, etc.)
+```
+
+### Multi-Tenant Attribution
+
+All integration methods support `tenant_id` and `caller_id`:
+- Passed in request body (API) or constructor (SDK)
+- Persisted to Memory for per-caller analytics and cost allocation
+- Fields are optional — omitting them has zero impact on existing behavior
+
+### Structured Error Model
+
+Error responses use `ErrorResponse` schema instead of raw `HTTPException`:
+
+| error_code | HTTP status | Trigger |
+|---|---|---|
+| `provider_auth_error` | 502 | Invalid/missing API key, authentication failure |
+| `provider_unavailable` | 502 | Provider timeout, rate limit, connection error |
+| `internal_error` | 500 | Unexpected exception in Core |
+
+Classification is done by `_classify_error()` in `api_server.py`, which inspects exception class name
+and message keywords against `_PROVIDER_KEYWORDS`.
+
+**Design decision:** 200 responses (including `budget_exceeded=True` and `status="dry_run"`) are
+unchanged. Error responses are the only breaking change vs. pre-v0.1.3, and only in the JSON structure
+(was `{"detail": "..."}`, now `{"error_code": "...", "message": "...", ...}`).
+
+### Open-Core Boundary
+
+| Public (GitHub) | Private (this doc) |
+|---|---|
+| API contract, CLI usage, integration examples | Core algorithms, routing logic, compressor internals |
+| `costagent_sdk.py`, `integrations/` | `core/agent_loop.py`, `core/semantic_compressor.py` |
+| `config/models_price.json` schema | `config/providers.py` cost_tier selection logic |
+| Quality eval feature description + config vars | `core/quality_evaluator.py` judge prompt, `_parse_score()`, retry algorithm |
+| README.md, docs/INTEGRATIONS.md | docs/IMPLEMENTATION_PLAN.md |
+
+---
+
+## 9. Interface Contracts (moved from README — private)
 
 ### CLI Interface
 
@@ -273,13 +374,14 @@ v0.1 (MVP)
 
 Response includes: `model`, `prompt_tokens`, `output_tokens`, `prompt_cost`, `completion_cost`,
 `total_cost`, `budget`, `budget_exceeded`, `cumulative_cost`, `log_id`, `response`, `actual_cost`,
-`actual_output_tokens`, `summary`
+`actual_output_tokens`, `quality_score`, `quality_reason`, `quality_retries`, `quality_eval_cost`,
+`original_model`, `summary`
 
 ---
 
-## 9. Extensibility Hooks (built into MVP, implemented later)
+## 10. Extensibility Hooks (built into MVP, implemented later)
 
-### 9.1 Enterprise Templates
+### 10.1 Enterprise Templates
 
 Pre-built prompt + model + level bundles for common business tasks.
 
@@ -296,7 +398,7 @@ Pre-built prompt + model + level bundles for common business tasks.
 New endpoint: `POST /api/run/template/{template_id}`
 New CLI: `python3 main.py run-template --template doc-summary --input-file contract.txt`
 
-### 9.2 Agent Integration
+### 10.2 Agent Integration
 
 | Integration | How it calls CostAgent |
 |---|---|
@@ -307,7 +409,7 @@ New CLI: `python3 main.py run-template --template doc-summary --input-file contr
 
 ---
 
-## 10. Design Principles
+## 11. Design Principles
 
 1. **Config over code** — adding a model or provider should only require config changes
 2. **Core is sacred** — `AgentLoop.run_task()` is the single orchestration method; don't bypass it
@@ -319,9 +421,9 @@ New CLI: `python3 main.py run-template --template doc-summary --input-file contr
 
 ---
 
-## 11. Environments & Observability
+## 12. Environments & Observability
 
-### 11.1 Multi-environment Memory
+### 12.1 Multi-environment Memory
 
 CostAgent supports multi-environment deployments by tagging each run with `env_name` and allowing the
 SQLite path to be overridden.
@@ -331,7 +433,22 @@ SQLite path to be overridden.
 | `ENV_NAME` | `dev` | Tag each run for multi-environment analysis (dev/staging/prod) |
 | `TASK_LOG_DB_PATH` | `memory/task_log.db` | Override SQLite path (recommended in Docker/production) |
 
-### 11.2 Operational logs (stdout)
+### 12.2 Quality Evaluation
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `QUALITY_EVAL_ENABLED` | `false` | Enable LLM-as-judge quality scoring (disabled = zero overhead) |
+| `QUALITY_THRESHOLD` | `6` | Minimum score (1-10) to accept a response without retry |
+| `QUALITY_MAX_RETRIES` | `2` | Max escalation retries (L1→L2→L3) on low quality |
+| `JUDGE_MODEL` | `gemini/gemini-2.0-flash` | litellm model ID for the judge (cheapest by default) |
+
+**Retry flow:** execute → judge scores → if score < threshold and level < 3, escalate model and retry → repeat up to `QUALITY_MAX_RETRIES` times. Final response is always the last attempt regardless of score.
+
+**Fail-open:** any judge error (network, parse, timeout) returns score=10 so the main pipeline is never blocked.
+
+**Memory fields:** `quality_score`, `quality_reason`, `quality_retries`, `quality_eval_cost`, `original_model` — auto-added to SQLite via `alter=True`.
+
+### 12.3 Operational logs (stdout)
 
 Operational logs are emitted as structured JSON lines to stdout and are intended for debugging and
 production observability. They include fine-grained lifecycle events and full exception stack traces.

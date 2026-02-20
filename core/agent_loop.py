@@ -3,8 +3,16 @@ import uuid
 
 import litellm
 
-from config.config import get_budget, get_model_prices
+from config.config import (
+    get_budget,
+    get_judge_model,
+    get_model_prices,
+    get_quality_eval_enabled,
+    get_quality_max_retries,
+    get_quality_threshold,
+)
 from core.probabilistic_router import ProbabilisticRouter
+from core.quality_evaluator import QualityEvaluator
 from core.semantic_compressor import SemanticCompressor
 from core.token_estimator import TokenEstimator
 from memory.log_handler import LogHandler
@@ -32,6 +40,11 @@ class AgentLoop:
         self.compressor = SemanticCompressor()
         self.router = ProbabilisticRouter(prices)
         self.logger = LogHandler()
+        self.quality_eval_enabled = get_quality_eval_enabled()
+        self.quality_threshold = get_quality_threshold()
+        self.quality_max_retries = get_quality_max_retries()
+        if self.quality_eval_enabled:
+            self.evaluator = QualityEvaluator(judge_model=get_judge_model())
 
     def run_task(
         self,
@@ -110,20 +123,61 @@ class AgentLoop:
 
             # 6. Execute or dry-run
             if execute and not budget_exceeded:
-                response = litellm.completion(
-                    model=model_name,
-                    messages=[{"role": "user", "content": compressed}],
-                    max_tokens=expected_output_tokens,
-                )
-                raw_content = response.choices[0].message.content or ""
+                current_level = task_level
+                current_model = model_name
+                quality_score = None
+                quality_reason = None
+                quality_retries = 0
+                total_eval_cost = 0.0
+                original_model = model_name
+                max_attempts = (1 + self.quality_max_retries) if self.quality_eval_enabled else 1
+
+                for _attempt in range(max_attempts):
+                    response = litellm.completion(
+                        model=current_model,
+                        messages=[{"role": "user", "content": compressed}],
+                        max_tokens=expected_output_tokens,
+                    )
+                    raw_content = response.choices[0].message.content or ""
+                    actual_cost = litellm.completion_cost(completion_response=response)
+                    usage = response.usage
+
+                    if self.quality_eval_enabled:
+                        eval_result = self.evaluator.evaluate(compressed, raw_content)
+                        quality_score = eval_result["score"]
+                        quality_reason = eval_result["reason"]
+                        total_eval_cost += eval_result["eval_cost"]
+
+                        if quality_score >= self.quality_threshold:
+                            break
+
+                        if current_level < 3:
+                            quality_retries += 1
+                            current_level += 1
+                            current_model = model_override or self.router.route_task(current_level)
+                            log_event(ops, "quality_retry",
+                                      trace_id=trace_id, score=quality_score,
+                                      from_model=original_model, to_model=current_model,
+                                      retry=quality_retries)
+                            continue
+                        else:
+                            break  # already at L3, accept
+                    else:
+                        break  # no eval, single pass
+
                 if raw_content.strip():
                     result["response"] = raw_content
                 else:
                     result["response"] = "[Empty response] Model returned no content. Try increasing --tokens or rephrasing."
-                result["actual_cost"] = litellm.completion_cost(completion_response=response)
-                usage = response.usage
+                result["actual_cost"] = actual_cost
+                result["model"] = current_model
                 if usage:
                     result["actual_output_tokens"] = usage.completion_tokens
+                result["quality_score"] = quality_score
+                result["quality_reason"] = quality_reason
+                result["quality_retries"] = quality_retries
+                result["quality_eval_cost"] = total_eval_cost
+                result["original_model"] = original_model if quality_retries > 0 else None
                 status = "executed"
             else:
                 if budget_exceeded:
@@ -134,6 +188,11 @@ class AgentLoop:
                     status = "dry_run"
                 result["actual_cost"] = None
                 result["actual_output_tokens"] = None
+                result["quality_score"] = None
+                result["quality_reason"] = None
+                result["quality_retries"] = None
+                result["quality_eval_cost"] = None
+                result["original_model"] = None
 
             t_end = time.perf_counter()
             result["latency_ms"] = (t_end - t_start) * 1000.0
